@@ -344,6 +344,8 @@ class TritonAttentionBackend(AttentionBackend):
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
+        "turbo_quant",       # TurboQuant V1 : rotation Hadamard + 4-bit Lloyd-Max + fp16 norm (arXiv:2504.19874)
+        "turbo_quant_3bit",  # TurboQuant V2 : rotation Hadamard + 3-bit Lloyd-Max + QJL 1-bit + fp8 norm
     ]
 
     @staticmethod
@@ -447,9 +449,11 @@ class TritonAttentionImpl(AttentionImpl):
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
-        if alibi_slopes is not None:
-            alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
-        self.alibi_slopes = alibi_slopes
+        alibi_slopes_t: torch.Tensor | None = (
+            torch.tensor(alibi_slopes, dtype=torch.float32)
+            if alibi_slopes is not None else None
+        )
+        self.alibi_slopes: torch.Tensor | None = alibi_slopes_t
         if sliding_window is None:
             self.sliding_window = (-1, -1)
         elif attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY):
@@ -473,12 +477,21 @@ class TritonAttentionImpl(AttentionImpl):
                 head_size=head_size,
                 num_kv_heads=num_kv_heads,
                 num_q_heads=num_heads,
+                b_bits=4,  # V1 : 4-bit Lloyd-Max + fp16 norme
+            )
+        elif kv_cache_dtype == "turbo_quant_3bit":
+            self.turbo_quant = TurboQuantKV(
+                head_size=head_size,
+                num_kv_heads=num_kv_heads,
+                num_q_heads=num_heads,
+                b_bits=3,  # V2 : 3-bit Lloyd-Max + QJL 1-bit + fp8 norme
             )
 
         self.attn_type = attn_type
-        # turbo_quant utilise fp8_e5m2 comme format de stockage interne
+        # turbo_quant et turbo_quant_3bit utilisent fp8_e5m2 comme format de stockage interne
+        _is_turbo = kv_cache_dtype in ("turbo_quant", "turbo_quant_3bit")
         _fp8_dtype_key = kv_cache_dtype if kv_cache_dtype.startswith("fp8") else (
-            "fp8_e5m2" if kv_cache_dtype == "turbo_quant" else None
+            "fp8_e5m2" if _is_turbo else None
         )
         self.fp8_dtype = (
             _get_fp8_kv_cache_torch_dtype(_fp8_dtype_key)
@@ -560,7 +573,7 @@ class TritonAttentionImpl(AttentionImpl):
 
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(1)
-        if self.kv_cache_dtype.startswith("fp8") or self.kv_cache_dtype == "turbo_quant":
+        if self.kv_cache_dtype.startswith("fp8"):
             assert self.fp8_dtype is not None
             if key_cache.dtype != self.fp8_dtype:
                 key_cache = key_cache.view(self.fp8_dtype)
@@ -568,6 +581,12 @@ class TritonAttentionImpl(AttentionImpl):
             assert layer._q_scale_float == 1.0, (
                 "A non 1.0 q_scale is not currently supported."
             )
+        if self.kv_cache_dtype in ("turbo_quant", "turbo_quant_3bit"):
+            assert self.turbo_quant is not None
+            # TurboQuant : dequantifier le cache uint8 (indices int4 + norme fp16)
+            # vers fp16 avant le calcul d'attention (espace rotaté préservé)
+            key_cache = self.turbo_quant.dequantize_cache(key_cache, which="k")    # [nb, bs, nh, d] fp16
+            value_cache = self.turbo_quant.dequantize_cache(value_cache, which="v")  # [nb, bs, nh, d] fp16
 
         # TurboQuant : rotation de Q pour que Q_rot ⋅ K_rot^T = Q ⋅ K^T
         if self.turbo_quant is not None:
@@ -588,6 +607,14 @@ class TritonAttentionImpl(AttentionImpl):
         descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
+        # TurboQuant : pas de descale fp8 (le cache est déjà en fp16 dequantifié)
+        if self.kv_cache_dtype in ("turbo_quant", "turbo_quant_3bit"):
+            k_descale_arg = None
+            v_descale_arg = None
+        else:
+            k_descale_arg = layer._k_scale.expand(descale_shape)  # type: ignore[operator]
+            v_descale_arg = layer._v_scale.expand(descale_shape)  # type: ignore[operator]
+
         unified_attention(
             q=query[:num_actual_tokens],
             k=key_cache,
@@ -605,8 +632,8 @@ class TritonAttentionImpl(AttentionImpl):
             block_table=block_table,
             softcap=self.logits_soft_cap,
             q_descale=None,  # Not supported
-            k_descale=layer._k_scale.expand(descale_shape),
-            v_descale=layer._v_scale.expand(descale_shape),
+            k_descale=k_descale_arg,
+            v_descale=v_descale_arg,
             seq_threshold_3D=seq_threshold_3D,
             num_par_softmax_segments=num_par_softmax_segments,
             softmax_segm_output=softmax_segm_output,
@@ -693,25 +720,31 @@ class TritonAttentionImpl(AttentionImpl):
             # Reshape the input keys and values and store them in the cache.
             # Skip this if sharing KV cache with an earlier attention layer.
             if self.turbo_quant is not None:
-                # TurboQuant Phase 2 : rotation Hadamard de K ET V avant stockage
-                # K_rot = R·K  ; Q sera aussi tourné dans forward() → Q_rot·K_rot^T = Q·K^T
-                # V_rot = R·V  ; output sera un-tourné après unified_attention
+                # TurboQuant (V1 4-bit ou V2 3-bit+QJL) : rotation de K et V puis quantification
+                # K_rot Quantifié stocké dans le buffer uint8 du cache
+                # Q sera tourné dans forward() → Q_rot·K_rot^T = Q·K^T (scores identiques)
+                # V_rot stocké quantifié → output=Π·(attn·V), un-rotation post-attention
                 key = self.turbo_quant.rotate_kv(key)
                 value = self.turbo_quant.rotate_v(value)
-            if self.kv_cache_dtype.startswith("fp8") or self.kv_cache_dtype == "turbo_quant":
-                assert self.fp8_dtype is not None
-                key_cache = key_cache.view(self.fp8_dtype)
-                value_cache = value_cache.view(self.fp8_dtype)
-                # triton kernel does not support uint8 kv_cache
-                #  (because some explicit casts (e.g. float8_e4m3fnuz)
-                #   are not supported)
-            triton_reshape_and_cache_flash(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
-            )
+                # Quantifier + stocker via scatter PyTorch (bypass kernel Triton fp8)
+                self.turbo_quant.store_to_cache(
+                    key, value, key_cache, value_cache, slot_mapping
+                )
+            else:
+                if self.kv_cache_dtype.startswith("fp8"):
+                    assert self.fp8_dtype is not None
+                    key_cache = key_cache.view(self.fp8_dtype)
+                    value_cache = value_cache.view(self.fp8_dtype)
+                    # triton kernel does not support uint8 kv_cache
+                    #  (because some explicit casts (e.g. float8_e4m3fnuz)
+                    #   are not supported)
+                triton_reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )

@@ -41,6 +41,8 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "int8": torch.int8,
     "fp8_inc": torch.float8_e4m3fn,
     "fp8_ds_mla": torch.uint8,
+    "turbo_quant":      torch.uint8,  # TurboQuant V1 : 4-bit Lloyd-Max (arXiv:2504.19874)
+    "turbo_quant_3bit": torch.uint8,  # TurboQuant V2 : 3-bit + QJL 1-bit + fp8 norme
 }
 
 TORCH_DTYPE_TO_NUMPY_DTYPE = {
@@ -564,7 +566,7 @@ def current_stream() -> torch.cuda.Stream:
                     "Fail to set current stream, current platform "
                     "may not support current_stream with torch API"
                 )
-    return _current_stream_tls.value
+    return _current_stream_tls.value  # type: ignore[return-value]
 
 
 # Global auxilary stream for running operations in background streams.

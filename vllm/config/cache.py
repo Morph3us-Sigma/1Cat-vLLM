@@ -28,7 +28,8 @@ CacheDType = Literal[
     "fp8_e5m2",
     "fp8_inc",
     "fp8_ds_mla",
-    "turbo_quant",  # TurboQuant KV : rotation Hadamard aléatoire + fp8.  arXiv:2504.19874
+    "turbo_quant",       # TurboQuant V1 : rotation Hadamard + 4-bit Lloyd-Max + fp16 norm.  arXiv:2504.19874
+    "turbo_quant_3bit",  # TurboQuant V2 : rotation Hadamard + 3-bit Lloyd-Max + QJL 1-bit + fp8 norm.
 ]
 MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]

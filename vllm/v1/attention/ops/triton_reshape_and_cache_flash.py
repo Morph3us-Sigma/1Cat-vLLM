@@ -151,12 +151,14 @@ def triton_reshape_and_cache_flash(
     block_stride = key_cache.stride()[0]
     page_stride = key_cache.stride()[1]
 
-    assert kv_cache_dtype == "auto" or kv_cache_dtype.startswith("fp8"), (
+    # turbo_quant utilise fp8_e5m2 comme format de stockage
+    _eff_dtype = "fp8_e5m2" if kv_cache_dtype in ("turbo_quant", "turbo_quant_3bit") else kv_cache_dtype
+    assert _eff_dtype == "auto" or _eff_dtype.startswith("fp8"), (
         f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
     )
     kv_cache_torch_dtype = (
-        _get_fp8_kv_cache_torch_dtype(kv_cache_dtype)
-        if kv_cache_dtype.startswith("fp8")
+        _get_fp8_kv_cache_torch_dtype(_eff_dtype)
+        if _eff_dtype.startswith("fp8")
         else key_cache.dtype
     )
 
@@ -329,12 +331,14 @@ def triton_reshape_and_cache_flash_diffkv(
     block_stride = kv_cache.stride()[0]
     page_stride = kv_cache.stride()[1]
 
-    assert kv_cache_dtype == "auto" or kv_cache_dtype.startswith("fp8"), (
+    # turbo_quant utilise fp8_e5m2 comme format de stockage
+    _eff_dtype = "fp8_e5m2" if kv_cache_dtype in ("turbo_quant", "turbo_quant_3bit") else kv_cache_dtype
+    assert _eff_dtype == "auto" or _eff_dtype.startswith("fp8"), (
         f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
     )
     kv_cache_torch_dtype = (
-        _get_fp8_kv_cache_torch_dtype(kv_cache_dtype)
-        if kv_cache_dtype.startswith("fp8")
+        _get_fp8_kv_cache_torch_dtype(_eff_dtype)
+        if _eff_dtype.startswith("fp8")
         else kv_cache.dtype
     )
 
