@@ -34,6 +34,7 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
 )
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.model_executor.layers.quantization.turbo_quant_kv import TurboQuantKV
 
 logger = init_logger(__name__)
 
@@ -464,10 +465,24 @@ class TritonAttentionImpl(AttentionImpl):
 
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
+        # TurboQuant : rotation Hadamard aléatoire pour améliorer la quantification KV
+        # arXiv:2504.19874 — data-oblivious, applicable online
+        self.turbo_quant: TurboQuantKV | None = None
+        if kv_cache_dtype == "turbo_quant":
+            self.turbo_quant = TurboQuantKV(
+                head_size=head_size,
+                num_kv_heads=num_kv_heads,
+                num_q_heads=num_heads,
+            )
+
         self.attn_type = attn_type
+        # turbo_quant utilise fp8_e5m2 comme format de stockage interne
+        _fp8_dtype_key = kv_cache_dtype if kv_cache_dtype.startswith("fp8") else (
+            "fp8_e5m2" if kv_cache_dtype == "turbo_quant" else None
+        )
         self.fp8_dtype = (
-            _get_fp8_kv_cache_torch_dtype(kv_cache_dtype)
-            if kv_cache_dtype.startswith("fp8")
+            _get_fp8_kv_cache_torch_dtype(_fp8_dtype_key)
+            if _fp8_dtype_key is not None
             else None
         )
 
@@ -545,7 +560,7 @@ class TritonAttentionImpl(AttentionImpl):
 
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(1)
-        if self.kv_cache_dtype.startswith("fp8"):
+        if self.kv_cache_dtype.startswith("fp8") or self.kv_cache_dtype == "turbo_quant":
             assert self.fp8_dtype is not None
             if key_cache.dtype != self.fp8_dtype:
                 key_cache = key_cache.view(self.fp8_dtype)
@@ -553,6 +568,10 @@ class TritonAttentionImpl(AttentionImpl):
             assert layer._q_scale_float == 1.0, (
                 "A non 1.0 q_scale is not currently supported."
             )
+
+        # TurboQuant : rotation de Q pour que Q_rot ⋅ K_rot^T = Q ⋅ K^T
+        if self.turbo_quant is not None:
+            query = self.turbo_quant.rotate_q(query)
 
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens
@@ -597,6 +616,11 @@ class TritonAttentionImpl(AttentionImpl):
             output_scale=output_scale,
             mm_prefix_range=mm_prefix_range_tensor,
         )
+
+        # TurboQuant Phase 2 : un-rotation de l'output
+        # output_rot[t,h] = R_{h_kv} · output[t,h]  →  output[t,h] = R_{h_kv}^{-1} · output_rot[t,h]
+        if self.turbo_quant is not None:
+            self.turbo_quant.unrotate_output(output, num_actual_tokens)
 
         return output
 
@@ -668,7 +692,13 @@ class TritonAttentionImpl(AttentionImpl):
         ):
             # Reshape the input keys and values and store them in the cache.
             # Skip this if sharing KV cache with an earlier attention layer.
-            if self.kv_cache_dtype.startswith("fp8"):
+            if self.turbo_quant is not None:
+                # TurboQuant Phase 2 : rotation Hadamard de K ET V avant stockage
+                # K_rot = R·K  ; Q sera aussi tourné dans forward() → Q_rot·K_rot^T = Q·K^T
+                # V_rot = R·V  ; output sera un-tourné après unified_attention
+                key = self.turbo_quant.rotate_kv(key)
+                value = self.turbo_quant.rotate_v(value)
+            if self.kv_cache_dtype.startswith("fp8") or self.kv_cache_dtype == "turbo_quant":
                 assert self.fp8_dtype is not None
                 key_cache = key_cache.view(self.fp8_dtype)
                 value_cache = value_cache.view(self.fp8_dtype)

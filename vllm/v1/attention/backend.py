@@ -820,7 +820,12 @@ class SparseMLAAttentionImpl(AttentionImplBase[T], Generic[T]):
 
 
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
-    return kv_cache_dtype.startswith("fp8")
+    return kv_cache_dtype.startswith("fp8") or kv_cache_dtype == "turbo_quant"
+
+
+def is_turbo_quant_kv_cache(kv_cache_dtype: str) -> bool:
+    """True si le KV cache utilise TurboQuant (rotation Hadamard + fp8)."""
+    return kv_cache_dtype == "turbo_quant"
 
 
 def subclass_attention_backend(
