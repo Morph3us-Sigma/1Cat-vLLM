@@ -243,8 +243,8 @@ def turbo_deq_v2_triton(
         N=N, NH=NH, D=D,
         N3=n3, NS=ns,
         BLOCK_D=D,
-        num_warps=4,
-        num_stages=2,
+        num_warps=4,  # type: ignore[call-arg]
+        num_stages=2,  # type: ignore[call-arg]
     )
 
 
@@ -265,8 +265,8 @@ def turbo_deq_v1_triton(
         codebook,
         N=N, NH=NH, D=D,
         BLOCK_D=D,
-        num_warps=4,
-        num_stages=2,
+        num_warps=4,  # type: ignore[call-arg]
+        num_stages=2,  # type: ignore[call-arg]
     )
 
 

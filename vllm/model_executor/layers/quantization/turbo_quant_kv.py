@@ -1082,5 +1082,5 @@ class TurboQuantKV:
 
         result_dict = {"mse": mse, "snr_db": snr_db, "compression_ratio": ratio}
         if self.b_bits == 3:
-            result_dict["qjl_residual_mean"] = self._qjl_residual_mean
+            result_dict["qjl_residual_mean"] = self._qjl_residual_mean_k
         return result_dict

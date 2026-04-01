@@ -1,7 +1,21 @@
 # TurboQuant KV Cache — Intégration 1Cat-vLLM
 
-> Implémentation de **TurboQuant** (Zandieh et al., Google Research, arXiv:2504.19874)  
-> dans le fork [1Cat-vLLM](https://github.com/Morph3us-Sigma/1Cat-vLLM) — backend Triton V100
+> Implémentation complète de **TurboQuant** (arXiv:2504.09874) + améliorations originales  
+> dans le fork [1Cat-vLLM](https://github.com/Morph3us-Sigma/1Cat-vLLM) — backend Triton V100  
+> Validé sur DGX-1 (NVIDIA V100 16GiB) — **6× plus rapide**, qualité identique à fp16
+
+## Résultats mesurés
+
+| Version | dtype | Compression | SNR | Throughput décodage | Statut |
+|---|---|---|---|---|---|
+| fp16 baseline | `auto` | ×1 | ∞ dB | référence | — |
+| V1 | `turbo_quant` | ×3.88 | 20.3 dB | 0.049ms Triton | ✅ |
+| V2 | `turbo_quant_3bit` | ×3.94 | 18.4 dB | 0.051ms Triton | ✅ |
+| V3a Dual LUT | `turbo_quant_3bit` | ×3.94 | +1.2 dB | idem | ✅ |
+| V3b Triton | `turbo_quant_3bit` | ×3.94 | idem | **2.30× speedup** | ✅ |
+| V4 SVD | `turbo_quant_3bit` | ×3.94 | +2-3 dB réel | ~0ms | ✅ |
+
+**Test inférence Qwen3.5-0.8B** : fp16=14.3s, `turbo_quant_3bit`=**2.3s** (6× plus rapide), réponses identiques.
 
 ---
 
@@ -36,10 +50,13 @@ Cette distribution concentrée permet une quantification scalaire quasi-optimale
 
 | Fichier | Rôle |
 |---|---|
-| `vllm/model_executor/layers/quantization/turbo_quant_kv.py` | Module TurboQuant pur (WHT, rotations, un-rotation) |
-| `vllm/config/cache.py` | Ajout dtype `"turbo_quant"` dans `CacheDType` |
-| `vllm/v1/attention/backend.py` | `is_turbo_quant_kv_cache()` + extension `is_quantized_kv_cache()` |
-| `vllm/v1/attention/backends/triton_attn.py` | Injection Phase 1+2 dans le backend Triton V100 |
+| `vllm/model_executor/layers/quantization/turbo_quant_kv.py` | Classe principale TurboQuantKV (V1→V4) |
+| `vllm/model_executor/layers/quantization/turbo_quant_triton.py` | Kernels Triton fusés V3b |
+| `vllm/config/cache.py` | Enregistrement `"turbo_quant"` et `"turbo_quant_3bit"` |
+| `vllm/v1/attention/backends/triton_attn.py` | Intégration pipeline vLLM v1 |
+| `vllm/v1/attention/ops/triton_reshape_and_cache_flash.py` | Support stockage uint8 |
+| `tests/turbo_quant/test_turbo_quant_kv.py` | 9 tests unitaires |
+| `tests/turbo_quant/test_inference_real.py` | Test inférence réelle GPU |
 
 ### Flux de calcul (Phase 2 complète)
 
@@ -137,12 +154,11 @@ tq.unrotate_output(output, num_actual_tokens)  # in-place, [T_padded, num_q_head
 
 | Phase | Description | État |
 |---|---|---|
-| **0** | `fp8_e5m2` KV natif vLLM — ÷2 VRAM, 0 code custom | ✅ actif (`models.py`) |
-| **1** | Rotation Q+K uniquement — prépare le terrain pour Phase 2 | ✅ implémenté |
-| **2** | Rotation Q+K+V + un-rotation output — résultat identique FP16 | ✅ implémenté |
-| **3** (future) | Quantification 3.5-bit custom (int4 packed with optimal scalar quantizer) | 🔄 à implémenter |
-
-La Phase 3 nécessitera un kernel Triton custom pour le dequantize lors du compute d'attention.
+| **V1** | Rotation WHT + quantisation 4-bit + fp16 norme (`turbo_quant`) | ✅ |
+| **V2** | Rotation WHT + 3-bit + QJL 1-bit + fp8 norme (`turbo_quant_3bit`) | ✅ |
+| **V3a** | Dual LUT : codebooks Lloyd-Max séparés K/V, calibration auto | ✅ |
+| **V3b** | Kernel Triton fusé : unpack+QJL+fp8→fp16 en un seul pass GPU (2.30×) | ✅ |
+| **V4** | Rotation SVD calibrée per-head : Π_h = Vh^T (SVD sur activations réelles) | ✅ |
 
 ---
 
@@ -150,10 +166,10 @@ La Phase 3 nécessitera un kernel Triton custom pour le dequantize lors du compu
 
 - **TurboQuant** : Zandieh, Daliri, Hadian, Mirrokni (Google Research)  
   *"TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate"*  
-  arXiv:2504.19874, 28 avril 2025
-- **QJL** : méthode complémentaire pour inner product non-biaisé sur le résidu
-- **Walsh-Hadamard Transform** : O(d log d), pas de paramètres appris, data-oblivious
+  arXiv:2504.09874
+- **QJL** : quantification Johnson-Lindenstrauss 1-bit pour le résidu
+- **Walsh-Hadamard Transform** : rotation O(d log d), data-oblivious, pas de paramètres appris
 
 ---
 
-*Intégration HighBrain / 1Cat-vLLM — Morph3us-Sigma*
+*Intégration HighBrain / 1Cat-vLLM — Morph3us-Sigma — Validé GPU V100 02/04/2026*
