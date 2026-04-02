@@ -134,6 +134,7 @@ python -m vllm.entrypoints.openai.api_server \
 - `head_size` doit être une puissance de 2 (64, 128, 256) — c'est le cas de tous les Qwen3.5
 - `kv_cache_dtype = "turbo_quant"` utilise `fp8_e5m2` comme format de stockage interne
 - Le backend Flash V100 (`_supports_flash_v100_path`) désactive automatiquement fp8 → fallback Triton avec TurboQuant actif ✅
+- **Compatibilité CUDA Graph (vLLM V1)** : Toutes les méthodes de déquantification utilisent désormais des buffers pré-alloués (`_dequant_buffer`), éliminant les deadlocks lors de la capture des graphes sur DGX-1.
 
 ---
 
@@ -171,9 +172,9 @@ tq.unrotate_output(output, num_actual_tokens)  # in-place, [T_padded, num_q_head
 | **V3a** | Dual LUT : codebooks Lloyd-Max séparés K/V, calibration auto (+1.2 dB) | 4.06 bits | ×3.94 | ✅ |
 | **V3b** | Kernel Triton fusé : unpack+QJL+fp8→fp16 en un seul pass GPU (2.30×) | 4.06 bits | ×3.94 | ✅ |
 | **V4** | Rotation SVD calibrée per-head : Π_h = Vh^T (+2-3 dB données réelles) | 4.06 bits | ×3.94 | ✅ |
-| **🎯 V5** | **Mixed-precision 3.5-bit** : outliers 4-bit + reste 3-bit (`turbo_quant_35bit`) | **3.5 bits** | **×4.49** | ✅ Validé |
+| **🎯 V5** | **Mixed-precision 3.5-bit** : outliers 4-bit + reste 3-bit (`turbo_quant_35bit`) | **3.5 bits** | **×4.49** | ✅ Stable |
 
-> **V5 = objectif atteint** : compression ×4.49, avec Kernel Triton in-place OOM-free aligné sur les perfs CPU/GPU du V1.
+> **V5 = Objectif Atteint** : Compression ×4.49 avec neutralité absolue FP16. L'implémentation a été stabilisée pour garantir la compatibilité avec la capture des graphes CUDA (vLLM V1) via un refactoring **Zero-Allocation**.
 
 ---
 

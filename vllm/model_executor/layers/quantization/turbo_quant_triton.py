@@ -28,6 +28,7 @@ __all__ = [
     "turbo_deq_v1_triton",
     "turbo_deq_v2_triton",
     "turbo_deq_v5_triton",
+    "turbo_store_to_cache_triton",
     "is_triton_available",
 ]
 
@@ -418,3 +419,73 @@ def turbo_deq_v5_triton(
 
 def is_triton_available() -> bool:
     return _TRITON_AVAILABLE
+
+if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _turbo_store_kernel(
+        k_src_ptr, v_src_ptr,
+        k_cache_ptr, v_cache_ptr,
+        slot_mapping_ptr,
+        stride_k_src_tok, stride_k_src_h, stride_k_src_d,
+        stride_v_src_tok, stride_v_src_h, stride_v_src_d,
+        stride_k_cache_b, stride_k_cache_bs, stride_k_cache_h, stride_k_cache_d,
+        stride_v_cache_b, stride_v_cache_bs, stride_v_cache_h, stride_v_cache_d,
+        block_size: tl.constexpr,
+        head_size: tl.constexpr,
+        BLOCK_DSIZE: tl.constexpr,
+        max_slots: tl.constexpr,
+    ):
+        tok_idx = tl.program_id(0)
+        head_idx = tl.program_id(1)
+        
+        slot = tl.load(slot_mapping_ptr + tok_idx).to(tl.int64)
+        if slot < 0 or slot >= max_slots:
+            return
+            
+        block_idx = slot // block_size
+        block_off = slot % block_size
+        
+        # Offsets K
+        k_src_off = tok_idx * stride_k_src_tok + head_idx * stride_k_src_h
+        k_cache_off = block_idx * stride_k_cache_b + block_off * stride_k_cache_bs + head_idx * stride_k_cache_h
+        # Offsets V
+        v_src_off = tok_idx * stride_v_src_tok + head_idx * stride_v_src_h
+        v_cache_off = block_idx * stride_v_cache_b + block_off * stride_v_cache_bs + head_idx * stride_v_cache_h
+        
+        offs = tl.arange(0, BLOCK_DSIZE)
+        mask = offs < head_size
+        
+        # Store K
+        k_vals = tl.load(k_src_ptr + k_src_off + offs * stride_k_src_d, mask=mask)
+        tl.store(k_cache_ptr + k_cache_off + offs * stride_k_cache_d, k_vals, mask=mask)
+        # Store V
+        v_vals = tl.load(v_src_ptr + v_src_off + offs * stride_v_src_d, mask=mask)
+        tl.store(v_cache_ptr + v_cache_off + offs * stride_v_cache_d, v_vals, mask=mask)
+
+    @torch.compiler.disable
+    def turbo_store_to_cache_triton(
+        k_src: torch.Tensor, v_src: torch.Tensor,
+        k_cache: torch.Tensor, v_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Stockage KV Cache optimisé Triton (K+V fused scatter)."""
+        if not _TRITON_AVAILABLE:
+            raise RuntimeError("Triton non disponible")
+
+        N, NH, D = k_src.shape
+        NB, BS, _, _ = k_cache.shape
+        BLOCK_DSIZE = triton.next_power_of_2(D)
+        
+        grid = (N, NH)
+        _turbo_store_kernel[grid](
+            k_src, v_src, k_cache, v_cache, slot_mapping,
+            k_src.stride(0), k_src.stride(1), k_src.stride(2),
+            v_src.stride(0), v_src.stride(1), v_src.stride(2),
+            k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
+            v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
+            block_size=BS, head_size=D, BLOCK_DSIZE=BLOCK_DSIZE,
+            max_slots=NB * BS,
+            num_warps=4,  # type: ignore[call-arg]
+            num_stages=2, # type: ignore[call-arg]
+        )
