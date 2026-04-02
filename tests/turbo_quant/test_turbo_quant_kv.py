@@ -523,6 +523,191 @@ def test_svd_v4_gqa():
     return ok_all
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  10. Tests V5 Mixed-Precision 3.5-bit
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_v5_buffer_layout():
+    """Vérifie le layout du buffer V5 : 57 bytes utilisés sur 128 alloués pour d=128."""
+    print(f"\n{SEP}")
+    print("  TEST 10 : V5 — Layout buffer 3.5-bit")
+    print(SEP)
+    ok_all = True
+
+    for d, expected_used in [(64, 29), (128, 57), (256, 113)]:
+        n_out  = d // 2
+        n_reg  = d - n_out
+        n4_bytes = n_out // 2      # nibble packing
+        n3_bytes = 3 * n_reg // 8  # 8v/3B packing
+        used = n4_bytes + n3_bytes + 1  # +1 norme fp8
+        ratio = (d * 16) / (used * 8)
+        ok = used == expected_used
+        ok_all &= ok
+        check(
+            f"d={d} : {used}B utilisés ({ratio:.2f}× vs fp16)",
+            ok,
+            f"attendu {expected_used}B",
+        )
+
+    return ok_all
+
+
+def test_v5_snr():
+    """Vérifie que V5 atteint un SNR acceptable après calibration (≥12 dB avec données aléatoires)."""
+    print(f"\n{SEP}")
+    print("  TEST 11 : V5 — SNR après calibration")
+    print(SEP)
+    ok_all = True
+
+    def snr(orig: torch.Tensor, recon: torch.Tensor) -> float:
+        sig  = orig.float().pow(2).mean()
+        noise = (orig.float() - recon.float()).pow(2).mean()
+        return 10 * math.log10((sig / noise.clamp(min=1e-12)).item())
+
+    for d in [64, 128]:
+        tq = TurboQuantKV(head_size=d, num_kv_heads=2, num_q_heads=4,
+                          b_bits=4, mixed_bits=True, calib_target=300)
+
+        torch.manual_seed(42)
+        T_calib = 400
+        # Données L2-normalisées comme dans store_to_cache
+        k_raw = torch.randn(T_calib, 2, d, dtype=torch.float32)
+        v_raw = torch.randn(T_calib, 2, d, dtype=torch.float32)
+        k_rot = tq.rotate_kv(k_raw.half()).float()
+        v_rot = tq.rotate_v(v_raw.half()).float()
+        k_norm = k_rot / k_rot.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        v_norm = v_rot / v_rot.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        tq._run_calibration(k_norm.reshape(-1, d), v_norm.reshape(-1, d))
+
+        ok_cal = check(f"d={d}: _outlier_sorted_idx_cpu défini",
+                       tq._outlier_sorted_idx_cpu is not None)
+        ok_all &= ok_cal
+        if not ok_cal:
+            continue
+
+        # Test données de test (distinctes des données de calibration)
+        torch.manual_seed(99)
+        k_test = torch.randn(50, 2, d, dtype=torch.float16)
+        v_test = torch.randn(50, 2, d, dtype=torch.float16)
+        k_test_rot = tq.rotate_kv(k_test)
+        v_test_rot = tq.rotate_v(v_test)
+
+        k_u8 = tq.quantize_to_uint8(k_test_rot, which="k")
+        v_u8 = tq.quantize_to_uint8(v_test_rot, which="v")
+        k_deq = tq.dequantize_from_uint8(k_u8, which="k").float()
+        v_deq = tq.dequantize_from_uint8(v_u8, which="v").float()
+
+        snr_k = snr(k_test_rot.float(), k_deq)
+        snr_v = snr(v_test_rot.float(), v_deq)
+
+        # Compression effective
+        n4_bytes = (d // 2) // 2
+        n3_bytes = 3 * (d - d // 2) // 8
+        used_bytes = n4_bytes + n3_bytes + 1
+        ratio = (d * 16) / (used_bytes * 8)
+
+        ok_snr_k = snr_k >= 12.0
+        ok_snr_v = snr_v >= 12.0
+        ok_all &= ok_snr_k and ok_snr_v
+        check(f"d={d}: SNR K = {snr_k:.1f} dB (≥12)", ok_snr_k)
+        check(f"d={d}: SNR V = {snr_v:.1f} dB (≥12)", ok_snr_v)
+        check(f"d={d}: compression = {ratio:.2f}× (cible ×4.49)", True,
+              f"{used_bytes}B/{d}B alloués")
+
+    return ok_all
+
+
+def test_v5_fallback_before_calib():
+    """Avant calibration, V5 doit fallback sur V1 (4-bit) sans erreur."""
+    print(f"\n{SEP}")
+    print("  TEST 12 : V5 — Fallback V1 avant calibration")
+    print(SEP)
+    ok_all = True
+
+    tq_v5 = TurboQuantKV(head_size=128, num_kv_heads=4, num_q_heads=8,
+                          b_bits=4, mixed_bits=True)
+    tq_v1 = TurboQuantKV(head_size=128, num_kv_heads=4, num_q_heads=8,
+                          b_bits=4, mixed_bits=False)
+
+    torch.manual_seed(7)
+    x = torch.randn(16, 4, 128, dtype=torch.float16)
+
+    # Sans calibration, _quantize_v5 doit appeler _quantize_v1 → résultat identique
+    u8_v5 = tq_v5.quantize_to_uint8(x, which="k")
+    u8_v1 = tq_v1.quantize_to_uint8(x, which="k")
+    ok = torch.equal(u8_v5, u8_v1)
+    ok_all &= check("quantize V5 (sans calib) = quantize V1", ok)
+
+    deq_v5 = tq_v5.dequantize_from_uint8(u8_v5, which="k")
+    deq_v1 = tq_v1.dequantize_from_uint8(u8_v1, which="k")
+    ok2 = torch.equal(deq_v5, deq_v1)
+    ok_all &= check("dequantize V5 (sans calib) = dequantize V1", ok2)
+
+    return ok_all
+
+
+def test_v5_outlier_mask_shape():
+    """Vérifie que le masque outliers a la bonne forme [nh, d//2] et est disjoint du masque régulier."""
+    print(f"\n{SEP}")
+    print("  TEST 13 : V5 — Forme et disjonction des masques outliers/réguliers")
+    print(SEP)
+    ok_all = True
+
+    for d, nh in [(64, 4), (128, 2)]:
+        tq = TurboQuantKV(head_size=d, num_kv_heads=nh, num_q_heads=nh,
+                          b_bits=4, mixed_bits=True, calib_target=200)
+        torch.manual_seed(0)
+        T = 300
+        k_flat = torch.randn(T * nh, d)
+        v_flat = torch.randn(T * nh, d)
+        k_norm = k_flat / k_flat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        v_norm = v_flat / v_flat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        tq._run_calibration(k_norm, v_norm)
+
+        out_idx = tq._outlier_sorted_idx_cpu
+        reg_idx = tq._regular_sorted_idx_cpu
+
+        ok_shape_out = out_idx is not None and out_idx.shape == (nh, d // 2)
+        ok_shape_reg = reg_idx is not None and reg_idx.shape == (nh, d // 2)
+        ok_all &= check(f"d={d} nh={nh}: outlier_idx shape [{nh},{d//2}]", ok_shape_out)
+        ok_all &= check(f"d={d} nh={nh}: regular_idx shape [{nh},{d//2}]", ok_shape_reg)
+
+        if ok_shape_out and ok_shape_reg:
+            # Vérifier disjonction : union = {0..d-1} et intersection = {}
+            for h in range(nh):
+                all_idx = set(out_idx[h].tolist()) | set(reg_idx[h].tolist())
+                inter   = set(out_idx[h].tolist()) & set(reg_idx[h].tolist())
+                ok_union = all_idx == set(range(d))
+                ok_inter = len(inter) == 0
+                ok_all &= check(f"  tête {h}: union = [0..{d-1}]", ok_union,
+                                f"len={len(all_idx)}")
+                ok_all &= check(f"  tête {h}: intersection = ∅", ok_inter,
+                                f"len={len(inter)}")
+
+    return ok_all
+
+
+def test_v5_config():
+    """Vérifie que turbo_quant_35bit est enregistré dans la config vLLM."""
+    print(f"\n{SEP}")
+    print("  TEST 14 : V5 — Config vLLM turbo_quant_35bit")
+    print(SEP)
+
+    from vllm.config.cache import CacheDType
+    ok1 = check("'turbo_quant_35bit' dans CacheDType",
+                "turbo_quant_35bit" in str(CacheDType))
+
+    try:
+        from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+        t = STR_DTYPE_TO_TORCH_DTYPE["turbo_quant_35bit"]
+        ok2 = check("torch_utils : turbo_quant_35bit → torch.uint8",
+                    t == torch.uint8, f"got {t}")
+    except Exception as e:
+        ok2 = check("torch_utils : turbo_quant_35bit → torch.uint8", False, str(e))
+
+    return ok1 and ok2
+
+
 def main():
     print("\n" + "═" * 70)
     print("  TurboQuant KV Cache — Suite de tests")
@@ -530,15 +715,20 @@ def main():
     print("═" * 70)
 
     results = {
-        "WHT"                : test_wht(),
-        "Invariants"         : test_invariants(),
-        "Phase 2"            : test_phase2_correctness(),
-        "GQA"                : test_gqa(),
-        "Config vLLM"        : test_vllm_config(),
-        "Dual LUT K/V V3a"   : test_dual_lut(),
-        "Dual LUT auto-trig" : test_dual_lut_auto_trigger(),
-        "SVD V4 per-head"    : test_svd_v4(),
-        "SVD V4 GQA"         : test_svd_v4_gqa(),
+        "WHT"                  : test_wht(),
+        "Invariants"           : test_invariants(),
+        "Phase 2"              : test_phase2_correctness(),
+        "GQA"                  : test_gqa(),
+        "Config vLLM"          : test_vllm_config(),
+        "Dual LUT K/V V3a"     : test_dual_lut(),
+        "Dual LUT auto-trig"   : test_dual_lut_auto_trigger(),
+        "SVD V4 per-head"      : test_svd_v4(),
+        "SVD V4 GQA"           : test_svd_v4_gqa(),
+        "V5 buffer layout"     : test_v5_buffer_layout(),
+        "V5 SNR"               : test_v5_snr(),
+        "V5 fallback avant cal": test_v5_fallback_before_calib(),
+        "V5 masque outliers"   : test_v5_outlier_mask_shape(),
+        "V5 config vLLM"       : test_v5_config(),
     }
 
     bench_wht()
@@ -553,7 +743,7 @@ def main():
     print("═" * 70)
 
     if all_ok:
-        print("\n  🎉  Tous les tests passent — TurboQuant V4 (SVD per-head) validé ✅\n")
+        print("\n  🎉  Tous les tests passent — TurboQuant V5 (3.5-bit) validé ✅\n")
     else:
         print("\n  ⚠️  Des tests ont échoué — voir détails ci-dessus\n")
         sys.exit(1)

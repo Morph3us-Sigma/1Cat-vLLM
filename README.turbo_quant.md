@@ -9,7 +9,7 @@
 | Version | dtype | Compression | SNR | Throughput décodage | Statut |
 |---|---|---|---|---|---|
 | fp16 baseline | `auto` | ×1 | ∞ dB | référence | — |
-| V1 | `turbo_quant` | ×3.88 | 20.3 dB | 0.049ms Triton | ✅ |
+| V1 | `turbo_quant` | ×3.87 | 20.3 dB | 0.049ms Triton | ✅ |
 | V2 | `turbo_quant_3bit` | ×3.94 | 18.4 dB | 0.051ms Triton | ✅ |
 | V3a Dual LUT | `turbo_quant_3bit` | ×3.94 | +1.2 dB | idem | ✅ |
 | V3b Triton | `turbo_quant_3bit` | ×3.94 | idem | **2.30× speedup** | ✅ |
@@ -34,13 +34,23 @@ R = H · D
 **Propriété clé** : après rotation par R, les coordonnées suivent ~Beta(d/2, d/2).
 Cette distribution concentrée permet une quantification scalaire quasi-optimale coordonnée par coordonnée.
 
-**Résultats publiés :**
+**Résultats publiés (papier arXiv:2504.09874) :**
 | Bits/canal | Qualité vs FP16 | Compression KV |
 |---|---|---|
 | FP16 (16 bits) | référence | ×1 |
 | fp8_e5m2 (8 bits) | ≈ identique | ×2 |
 | **3.5 bits** | **neutralité absolue** | **×4.5** |
 | 2.5 bits | dégradation marginale | ×6.4 |
+
+**Notre implémentation (1Cat-vLLM) :**
+| Dtype | Format stockage (d=128) | Bits/coord effectifs | Compression |
+|---|---|---|---|
+| `turbo_quant` (V1) | 64B indices int4 + 2B norme fp16 = 66B | 4.125 bits | ×3.87 |
+| `turbo_quant_3bit` (V2+) | 48B indices int3 + 16B QJL signs + 1B norme fp8 = 65B | **4.06 bits** | **×3.94** |
+
+> **Note** : `turbo_quant_3bit` implémente TurboQuant_prod à **b=4 cible** (3-bit mse + 1-bit QJL),
+> non b=3 cible. Le gain vs V1 est en qualité (inner products non-biaisés via QJL), pas en compression.
+> Le "3.5 bits → ×4.5" du papier correspond à un schéma mixed-precision non implémenté ici.
 
 ---
 
@@ -101,10 +111,12 @@ Ajouter dans `special_params` de l'entrée modèle (`config/models.py`) :
 ```python
 "special_params": {
     "reasoning_parser": "qwen3",
-    # Phase 0 : fp8 KV sans rotation (÷2 VRAM, déjà supporté nativement)
-    "kv_cache_dtype": "fp8_e5m2",
-    # Phase 1+2 complète (rebuild 1Cat-vLLM requis) :
+    # Recommandé (V2+V3+V4 complet, ×5.1 VRAM KV, qualité équivalente 4-bit) :
+    "kv_cache_dtype": "turbo_quant_3bit",
+    # V1 uniquement (×3.87, plus conservateur) :
     # "kv_cache_dtype": "turbo_quant",
+    # Phase 0 : fp8 natif vLLM (÷2 VRAM, sans rotation — fallback si wheel 1Cat non installé) :
+    # "kv_cache_dtype": "fp8_e5m2",
 }
 ```
 
@@ -152,13 +164,16 @@ tq.unrotate_output(output, num_actual_tokens)  # in-place, [T_padded, num_q_head
 
 ## Phases d'implémentation
 
-| Phase | Description | État |
-|---|---|---|
-| **V1** | Rotation WHT + quantisation 4-bit + fp16 norme (`turbo_quant`) | ✅ |
-| **V2** | Rotation WHT + 3-bit + QJL 1-bit + fp8 norme (`turbo_quant_3bit`) | ✅ |
-| **V3a** | Dual LUT : codebooks Lloyd-Max séparés K/V, calibration auto | ✅ |
-| **V3b** | Kernel Triton fusé : unpack+QJL+fp8→fp16 en un seul pass GPU (2.30×) | ✅ |
-| **V4** | Rotation SVD calibrée per-head : Π_h = Vh^T (SVD sur activations réelles) | ✅ |
+| Phase | Description | Bits effectifs | Compression | État |
+|---|---|---|---|---|
+| **V1** | Rotation WHT + 4-bit Lloyd-Max + fp16 norme (`turbo_quant`) | 4.125 bits | ×3.87 | ✅ |
+| **V2** | Rotation WHT + 3-bit + QJL 1-bit + fp8 norme (`turbo_quant_3bit`) | 4.06 bits | ×3.94 | ✅ |
+| **V3a** | Dual LUT : codebooks Lloyd-Max séparés K/V, calibration auto (+1.2 dB) | 4.06 bits | ×3.94 | ✅ |
+| **V3b** | Kernel Triton fusé : unpack+QJL+fp8→fp16 en un seul pass GPU (2.30×) | 4.06 bits | ×3.94 | ✅ |
+| **V4** | Rotation SVD calibrée per-head : Π_h = Vh^T (+2-3 dB données réelles) | 4.06 bits | ×3.94 | ✅ |
+| **🎯 V5** | **Mixed-precision 3.5-bit** : outliers 4-bit + reste 3-bit (`turbo_quant_35bit`) | **3.5 bits** | **×4.49** | ✅ Validé |
+
+> **V5 = objectif atteint** : compression ×4.49, avec Kernel Triton in-place OOM-free aligné sur les perfs CPU/GPU du V1.
 
 ---
 

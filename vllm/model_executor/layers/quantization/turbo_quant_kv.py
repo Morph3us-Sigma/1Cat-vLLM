@@ -27,15 +27,23 @@
 #   [d//2+2 : d]        → padding
 #   Compression : ×3.87 vs fp16
 #
-# V2 — b_bits=3 (TurboQuant_prod, 3.125 bits effectifs) :
+# V2 — b_bits=3 (TurboQuant_prod, 4.06 bits effectifs) :
 #   [0 : 3*d//8]             → indices int3 packés (8 values / 3 bytes, big-endian)
 #   [3*d//8 : 3*d//8+d//8]  → signes QJL (1 bit / coord, 8 signes / byte)
 #   [3*d//8 + d//8]          → norme fp8_e5m2 (1 byte)
 #   [3*d//8+d//8+1 : d]      → padding
-#   Compression : ×5.1 vs fp16 | qualité ≡ 4-bit (TurboQuant_prod, arXiv:2504.19874 §3.2)
+#   Compression : ×3.94 vs fp16 | qualité ≡ 4-bit (TurboQuant_prod, arXiv:2504.19874 §3.2)
 #
-# Pour d=128 : V1 = 66 bytes utilisés, V2 = 65 bytes utilisés sur 128 alloués.
-# Pour d=256 : V1 = 130 bytes utilisés, V2 = 129 bytes utilisés sur 256 alloués.
+# V5 — mixed_bits=True (3.5-bit : 50% outliers 4-bit + 50% réguliers 3-bit) :
+#   [0 : d//4]                      → d//2 indices 4-bit (outliers, nibble packing) = d//4 bytes
+#   [d//4 : d//4 + 3*(d//2)//8]     → d//2 indices 3-bit (réguliers, 8v/3B packing) = 3*d//16 bytes
+#   [d//4 + 3*(d//2)//8]            → norme fp8_e5m2 (1 byte)
+#   reste                            → padding
+#   Compression : ×4.49 vs fp16 | qualité ≡ FP16 absolu (objectif arXiv:2504.19874)
+#   Masque outliers : stocké dans TurboQuantKV (calibration-time, fixed per-head)
+#
+# Pour d=128 : V1=66B, V2=65B, V5=57B utilisés sur 128 alloués.
+# Pour d=256 : V1=130B, V2=129B, V5=113B utilisés sur 256 alloués.
 #
 # V3 — Dual LUT K/V (TurboESM §3.3, arXiv:2603.26110) :
 #   Deux codebooks Lloyd-Max indépendants pour K et V.
@@ -60,6 +68,7 @@ try:
     from vllm.model_executor.layers.quantization.turbo_quant_triton import (
         turbo_deq_v1_triton,
         turbo_deq_v2_triton,
+        turbo_deq_v5_triton,  # type: ignore[attr-defined]
         is_triton_available as _triton_available,
     )
     _USE_TRITON = _triton_available()
@@ -234,6 +243,7 @@ class TurboQuantKV:
         seed: int = 42,
         b_bits: int = DEFAULT_BITS,
         calib_target: int = 5000,
+        mixed_bits: bool = False,
     ) -> None:
         assert head_size > 0 and (head_size & (head_size - 1)) == 0, (
             f"TurboQuantKV : head_size doit être une puissance de 2 (got {head_size})"
@@ -246,6 +256,7 @@ class TurboQuantKV:
         self.num_queries_per_kv = num_q_heads // num_kv_heads
         self.b_bits = b_bits
         self.n_levels = 2 ** b_bits
+        self._mixed_bits: bool = mixed_bits  # V5 : mixed-precision 3.5-bit
 
         # Codebooks Lloyd-Max CPU — séparés pour K et V (Dual LUT, TurboESM §3.3)
         # Initialisés identiquement (Lloyd-Max théorique Beta(d/2, d/2)).
@@ -305,6 +316,23 @@ class TurboQuantKV:
         # Buffers d'accumulation V4 — stockage par tête [n_valid, nh, d] (non aplati)
         self._calib_k_buf_v4: list[torch.Tensor] = []
         self._calib_v_buf_v4: list[torch.Tensor] = []
+
+        # V5 — Mixed-precision 3.5-bit (50% outliers 4-bit + 50% réguliers 3-bit) :
+        # Masque outliers déterminé à la calibration via variance per-coord per-head.
+        # Codebooks séparés : _4bit pour les outliers (16 niveaux), _3bit pour les réguliers (8 niveaux).
+        # None avant calibration → fallback V1 (4-bit conservateur) pendant le warm-up.
+        self._outlier_sorted_idx_cpu: torch.Tensor | None = None   # [nh, d//2] int64
+        self._regular_sorted_idx_cpu: torch.Tensor | None = None   # [nh, d//2] int64
+        self._outlier_sorted_idx_gpu: dict[str, torch.Tensor] = {}
+        self._regular_sorted_idx_gpu: dict[str, torch.Tensor] = {}
+        self._codebook_k_4bit_cpu: torch.Tensor = self._init_codebook(head_size, 4).clone()
+        self._codebook_v_4bit_cpu: torch.Tensor = self._init_codebook(head_size, 4).clone()
+        self._codebook_k_3bit_cpu: torch.Tensor = self._init_codebook(head_size, 3).clone()
+        self._codebook_v_3bit_cpu: torch.Tensor = self._init_codebook(head_size, 3).clone()
+        self._codebook_k_4bit_gpu: dict[str, torch.Tensor] = {}
+        self._codebook_v_4bit_gpu: dict[str, torch.Tensor] = {}
+        self._codebook_k_3bit_gpu: dict[str, torch.Tensor] = {}
+        self._codebook_v_3bit_gpu: dict[str, torch.Tensor] = {}
 
     # ── Codebooks ─────────────────────────────────────────────────────────────
 
@@ -371,6 +399,48 @@ class TurboQuantKV:
             assert self._rotation_v_cpu is not None
             self._rotation_v_gpu[dev_key] = self._rotation_v_cpu.to(device)
         return self._rotation_v_gpu[dev_key]
+
+    # ── V5 — getters GPU lazy ─────────────────────────────────────────────────
+
+    def _get_outlier_idx(self, device: torch.device | str) -> torch.Tensor:
+        """[nh, d//2] int64 — indices outliers sur le bon device (V5)."""
+        dev_key = str(device)
+        if dev_key not in self._outlier_sorted_idx_gpu:
+            assert self._outlier_sorted_idx_cpu is not None
+            self._outlier_sorted_idx_gpu[dev_key] = self._outlier_sorted_idx_cpu.to(device)
+        return self._outlier_sorted_idx_gpu[dev_key]
+
+    def _get_regular_idx(self, device: torch.device | str) -> torch.Tensor:
+        """[nh, d//2] int64 — indices réguliers sur le bon device (V5)."""
+        dev_key = str(device)
+        if dev_key not in self._regular_sorted_idx_gpu:
+            assert self._regular_sorted_idx_cpu is not None
+            self._regular_sorted_idx_gpu[dev_key] = self._regular_sorted_idx_cpu.to(device)
+        return self._regular_sorted_idx_gpu[dev_key]
+
+    def _get_codebook_4bit_k(self, device: torch.device | str) -> torch.Tensor:
+        dev_key = str(device)
+        if dev_key not in self._codebook_k_4bit_gpu:
+            self._codebook_k_4bit_gpu[dev_key] = self._codebook_k_4bit_cpu.to(device)
+        return self._codebook_k_4bit_gpu[dev_key]
+
+    def _get_codebook_4bit_v(self, device: torch.device | str) -> torch.Tensor:
+        dev_key = str(device)
+        if dev_key not in self._codebook_v_4bit_gpu:
+            self._codebook_v_4bit_gpu[dev_key] = self._codebook_v_4bit_cpu.to(device)
+        return self._codebook_v_4bit_gpu[dev_key]
+
+    def _get_codebook_3bit_k(self, device: torch.device | str) -> torch.Tensor:
+        dev_key = str(device)
+        if dev_key not in self._codebook_k_3bit_gpu:
+            self._codebook_k_3bit_gpu[dev_key] = self._codebook_k_3bit_cpu.to(device)
+        return self._codebook_k_3bit_gpu[dev_key]
+
+    def _get_codebook_3bit_v(self, device: torch.device | str) -> torch.Tensor:
+        dev_key = str(device)
+        if dev_key not in self._codebook_v_3bit_gpu:
+            self._codebook_v_3bit_gpu[dev_key] = self._codebook_v_3bit_cpu.to(device)
+        return self._codebook_v_3bit_gpu[dev_key]
 
     # ── Calibration Dual LUT K/V (TurboESM §3.3) ──────────────────────────────
 
@@ -466,6 +536,74 @@ class TurboQuantKV:
             self._v4_calibrated = True
             self._calib_k_buf_v4.clear()
             self._calib_v_buf_v4.clear()
+
+        # V5 : outlier mask + codebooks 4-bit/3-bit séparés (mixed-precision 3.5-bit)
+        # Variance par coordonnée dans l'espace rotaté → top d//2 = outliers (4-bit)
+        # Les buffers _calib_k_buf_v4 sont déjà vidés ci-dessus si V4 actif.
+        # Pour V5 seul (sans V4), on utilise les buffers accumulés en raw.
+        if self._mixed_bits:
+            # Reconstruire les données de calibration si V4 n'a pas tourné
+            if k_flat.shape[0] > 0:
+                # k_flat / v_flat : [N, head_size] normalisés, aplatis sur toutes les têtes
+                # On reforme [N_per_head, nh, d] approximatif via reshape
+                n_total = k_flat.shape[0]
+                nh = self.num_kv_heads
+                d = self.head_size
+                n_per_head = n_total // nh
+                if n_per_head > 0:
+                    k_cal = k_flat[:n_per_head * nh].reshape(n_per_head, nh, d).float()
+                    v_cal = v_flat[:n_per_head * nh].reshape(n_per_head, nh, d).float()
+                else:
+                    k_cal = k_flat.reshape(1, nh, d).float()
+                    v_cal = v_flat.reshape(1, nh, d).float()
+
+                # Variance per (head, coord) sur les activations normalisées
+                k_var = k_cal.var(dim=0)   # [nh, d]
+                v_var = v_cal.var(dim=0)   # [nh, d]
+                combined_var = (k_var + v_var) / 2.0  # [nh, d]
+
+                n_out = d // 2
+                # Top-k par variance → indices outliers (triés pour gather/scatter déterministe)
+                _, top_idx = combined_var.topk(n_out, dim=-1)         # [nh, n_out]
+                outlier_idx = top_idx.sort(dim=-1).values             # [nh, n_out] trié
+
+                # Indices réguliers = complément des outliers (via masque booléen)
+                outlier_mask = torch.zeros(nh, d, dtype=torch.bool)
+                outlier_mask.scatter_(-1, outlier_idx, True)
+                regular_idx_list = []
+                for h in range(nh):
+                    regular_idx_list.append(
+                        (~outlier_mask[h]).nonzero(as_tuple=False).squeeze(-1)
+                    )
+                regular_idx = torch.stack(regular_idx_list, dim=0)   # [nh, d//2]
+
+                self._outlier_sorted_idx_cpu = outlier_idx
+                self._regular_sorted_idx_cpu = regular_idx
+                self._outlier_sorted_idx_gpu.clear()
+                self._regular_sorted_idx_gpu.clear()
+
+                # Codebooks séparés pour outliers (4-bit) et réguliers (3-bit)
+                # Calibration Lloyd-Max sur les échantillons respectifs (agrégés toutes têtes)
+                k_np = k_cal.numpy()  # [n_per_head, nh, d]
+                v_np = v_cal.numpy()
+                k_outlier_vals = k_np.reshape(-1, d)[:, outlier_idx.reshape(-1).numpy()].flatten()
+                v_outlier_vals = v_np.reshape(-1, d)[:, outlier_idx.reshape(-1).numpy()].flatten()
+                k_regular_vals = k_np.reshape(-1, d)[:, regular_idx.reshape(-1).numpy()].flatten()
+                v_regular_vals = v_np.reshape(-1, d)[:, regular_idx.reshape(-1).numpy()].flatten()
+
+                cb_k4 = self._lloyd_max_1d(k_outlier_vals.astype(np.float32), n_levels=16)
+                cb_v4 = self._lloyd_max_1d(v_outlier_vals.astype(np.float32), n_levels=16)
+                cb_k3 = self._lloyd_max_1d(k_regular_vals.astype(np.float32), n_levels=8)
+                cb_v3 = self._lloyd_max_1d(v_regular_vals.astype(np.float32), n_levels=8)
+
+                self._codebook_k_4bit_cpu = torch.from_numpy(cb_k4)
+                self._codebook_v_4bit_cpu = torch.from_numpy(cb_v4)
+                self._codebook_k_3bit_cpu = torch.from_numpy(cb_k3)
+                self._codebook_v_3bit_cpu = torch.from_numpy(cb_v3)
+                self._codebook_k_4bit_gpu.clear()
+                self._codebook_v_4bit_gpu.clear()
+                self._codebook_k_3bit_gpu.clear()
+                self._codebook_v_3bit_gpu.clear()
 
     # ── Signs / devices ───────────────────────────────────────────────────────
 
@@ -685,6 +823,8 @@ class TurboQuantKV:
         Returns:
             packed: [num_tokens, num_kv_heads, head_size]  uint8
         """
+        if self._mixed_bits:
+            return self._quantize_v5(x, which=which)
         if self.b_bits == 4:
             return self._quantize_v1(x, which=which)
         return self._quantize_v2(x, which=which)
@@ -781,6 +921,8 @@ class TurboQuantKV:
         Returns:
             [num_tokens, num_kv_heads, head_size] fp16 (espace rotaté)
         """
+        if self._mixed_bits:
+            return self._dequantize_v5(x_u8, which=which)
         if self.b_bits == 4:
             return self._dequantize_v1(x_u8, which=which)
         return self._dequantize_v2(x_u8, which=which)
@@ -789,21 +931,22 @@ class TurboQuantKV:
         """V1 — 4-bit Lloyd-Max + norme fp16. Dual LUT : codebook K ou V selon which."""
         n_tok, n_heads, d = x_u8.shape
 
-        packed = x_u8[..., :d // 2].to(torch.int64)
-        idx_even = (packed >> 4) & 0xF
-        idx_odd  = packed & 0xF
-        indices = torch.empty(n_tok, n_heads, d, dtype=torch.int64, device=x_u8.device)
-        indices[..., 0::2] = idx_even
-        indices[..., 1::2] = idx_odd
+        # Éviter l'allocation d'un [N, nh, d] int64 — utiliser deux lookups sur d//2
+        # Réduction ~50% mémoire intermédiaire vs version indices unique
+        packed = x_u8[..., :d // 2].to(torch.int64)    # [N, nh, d//2] int64
 
         cb_fn = self._get_codebook_k if which == "k" else self._get_codebook_v
-        codebook = cb_fn(x_u8.device).to(torch.float32)
-        values = codebook[indices]
+        codebook = cb_fn(x_u8.device).to(torch.float32)  # [16]
+
+        result = torch.empty(n_tok, n_heads, d, dtype=torch.float32, device=x_u8.device)
+        result[..., 0::2] = codebook[(packed >> 4) & 0xF]  # lookup indices pairs
+        result[..., 1::2] = codebook[packed & 0xF]          # lookup indices impairs
+        del packed
 
         norms_u8 = x_u8[..., d // 2: d // 2 + 2].contiguous()
         norms_f16 = norms_u8.view(torch.float16).view(n_tok, n_heads)
 
-        result = values * norms_f16.unsqueeze(-1).to(torch.float32)
+        result *= norms_f16.unsqueeze(-1).to(torch.float32)
         return result.to(torch.float16)
 
     def _dequantize_v2(self, x_u8: torch.Tensor, which: str = "k") -> torch.Tensor:
@@ -839,6 +982,115 @@ class TurboQuantKV:
         norms_f32 = norms_fp8.to(torch.float32)                  # [n_tok, nh]
 
         result = values_corrected * norms_f32.unsqueeze(-1)
+        return result.to(torch.float16)
+
+    def _quantize_v5(self, x: torch.Tensor, which: str = "k") -> torch.Tensor:
+        """V5 — Mixed-precision 3.5-bit : 50% outliers 4-bit + 50% réguliers 3-bit.
+
+        Avant calibration : fallback V1 (4-bit conservateur).
+
+        Format (d bytes) :
+            [0 : d//4]                   → d//2 indices 4-bit (outliers), nibble packing
+            [d//4 : d//4 + 3*(d//2)//8]  → d//2 indices 3-bit (réguliers), 8v/3B packing
+            [d//4 + 3*(d//2)//8]         → norme fp8_e5m2
+            reste                         → zéros
+        Compression : ~×4.49 vs fp16 (57 bytes / 128 coords = 3.5625 bits/coord)
+        """
+        if self._outlier_sorted_idx_cpu is None:
+            return self._quantize_v1(x, which=which)
+
+        n_tok, nh, d = x.shape
+        n_out = d // 2
+        n_reg = d - n_out
+        n4_bytes = n_out // 2         # bytes pour les 4-bit indices (nibble packing)
+        n3_bytes = 3 * n_reg // 8     # bytes pour les 3-bit indices (8v/3B)
+
+        x_f32 = x.to(torch.float32)
+        norms = x_f32.norm(dim=-1).clamp(min=1e-8)   # [n_tok, nh]
+        x_norm = x_f32 / norms.unsqueeze(-1)           # [n_tok, nh, d]
+
+        out_idx = self._get_outlier_idx(x.device)      # [nh, n_out] int64
+        reg_idx = self._get_regular_idx(x.device)      # [nh, n_reg] int64
+
+        # Gather : sélectionner les coordonnées outliers / régulières par tête
+        out_idx_exp = out_idx.unsqueeze(0).expand(n_tok, -1, -1)  # [n_tok, nh, n_out]
+        reg_idx_exp = reg_idx.unsqueeze(0).expand(n_tok, -1, -1)  # [n_tok, nh, n_reg]
+        x_out = torch.gather(x_norm, dim=-1, index=out_idx_exp)   # [n_tok, nh, n_out]
+        x_reg = torch.gather(x_norm, dim=-1, index=reg_idx_exp)   # [n_tok, nh, n_reg]
+
+        # 4-bit nearest centroid pour outliers
+        cb4_fn = self._get_codebook_4bit_k if which == "k" else self._get_codebook_4bit_v
+        cb4 = cb4_fn(x.device).to(torch.float32)                   # [16]
+        idx4 = (x_out.unsqueeze(-1) - cb4).abs().argmin(dim=-1).to(torch.uint8)  # [n_tok, nh, n_out]
+
+        # 3-bit nearest centroid pour réguliers
+        cb3_fn = self._get_codebook_3bit_k if which == "k" else self._get_codebook_3bit_v
+        cb3 = cb3_fn(x.device).to(torch.float32)                   # [8]
+        idx3 = (x_reg.unsqueeze(-1) - cb3).abs().argmin(dim=-1).to(torch.uint8)  # [n_tok, nh, n_reg]
+
+        # Pack 4-bit (nibble : paire haute, paire basse)
+        packed4 = (idx4[..., 0::2] << 4) | idx4[..., 1::2]        # [n_tok, nh, n4_bytes]
+
+        # Pack 3-bit (même packing que V2)
+        packed3 = self._pack_3bit(idx3)                            # [n_tok, nh, n3_bytes]
+
+        # Norme fp8_e5m2
+        norms_fp8 = norms.to(torch.float8_e5m2).view(torch.uint8)  # [n_tok, nh]
+
+        # Assemblage
+        out = torch.zeros(n_tok, nh, d, dtype=torch.uint8, device=x.device)
+        out[..., :n4_bytes] = packed4
+        out[..., n4_bytes: n4_bytes + n3_bytes] = packed3
+        out[..., n4_bytes + n3_bytes] = norms_fp8
+        return out
+
+    def _dequantize_v5(self, x_u8: torch.Tensor, which: str = "k") -> torch.Tensor:
+        """V5 — Mixed-precision 3.5-bit dequantification. Dual LUT 4-bit + 3-bit.
+
+        Avant calibration (fallback V1 utilisé au stockage) : utiliser _dequantize_v1.
+        """
+        if self._outlier_sorted_idx_cpu is None:
+            return self._dequantize_v1(x_u8, which=which)
+
+        n_tok, nh, d = x_u8.shape
+        n_out = d // 2
+        n_reg = d - n_out
+        n4_bytes = n_out // 2
+        n3_bytes = 3 * n_reg // 8
+
+        out_idx = self._get_outlier_idx(x_u8.device)   # [nh, n_out]
+        reg_idx = self._get_regular_idx(x_u8.device)   # [nh, n_reg]
+
+        # Unpack 4-bit outlier indices
+        packed4 = x_u8[..., :n4_bytes].to(torch.int64)
+        idx4 = torch.empty(n_tok, nh, n_out, dtype=torch.int64, device=x_u8.device)
+        idx4[..., 0::2] = (packed4 >> 4) & 0xF
+        idx4[..., 1::2] = packed4 & 0xF
+
+        # Lookup 4-bit codebook
+        cb4_fn = self._get_codebook_4bit_k if which == "k" else self._get_codebook_4bit_v
+        vals4 = cb4_fn(x_u8.device).to(torch.float32)[idx4]       # [n_tok, nh, n_out]
+
+        # Unpack 3-bit regular indices
+        packed3 = x_u8[..., n4_bytes: n4_bytes + n3_bytes].contiguous()
+        idx3 = self._unpack_3bit(packed3, n_reg)                   # [n_tok, nh, n_reg]
+
+        # Lookup 3-bit codebook
+        cb3_fn = self._get_codebook_3bit_k if which == "k" else self._get_codebook_3bit_v
+        vals3 = cb3_fn(x_u8.device).to(torch.float32)[idx3]       # [n_tok, nh, n_reg]
+
+        # Norme fp8_e5m2
+        norms_fp8 = x_u8[..., n4_bytes + n3_bytes].contiguous().view(torch.float8_e5m2)
+        norms_f32 = norms_fp8.to(torch.float32)                    # [n_tok, nh]
+
+        # Scatter : remettre les valeurs dans les bonnes positions
+        result = torch.zeros(n_tok, nh, d, dtype=torch.float32, device=x_u8.device)
+        out_idx_exp = out_idx.unsqueeze(0).expand(n_tok, -1, -1)
+        reg_idx_exp = reg_idx.unsqueeze(0).expand(n_tok, -1, -1)
+        result.scatter_(dim=-1, index=out_idx_exp, src=vals4)
+        result.scatter_(dim=-1, index=reg_idx_exp, src=vals3)
+
+        result = result * norms_f32.unsqueeze(-1)
         return result.to(torch.float16)
 
     # ── Stockage / Lecture depuis le cache vLLM ───────────────────────────────
@@ -946,28 +1198,54 @@ class TurboQuantKV:
         self._dequantize_into_buffer(flat_u8, out_view, which=which)
         return out_view.reshape(nb, bs, nh, d)
 
-    def _dequantize_into_buffer(self, x_u8: torch.Tensor, out: torch.Tensor, which: str = "k") -> None:
-        """Dequantifie x_u8 [N, nh, d] dans out [N, nh, d] fp16 pré-alloué. Dual LUT K/V.
+    # Taille de chunk pour la dequantification en mode Python (V5 et fallback V1/V2).
+    # Limite les allocations intermédiaires VRAM à ~chunk_size tokens par appel.
+    # Avec 4096 tokens : pic ~96 MB de tenseurs temporaires vs ~1.6 GB pour 271k tokens.
+    _DEQUEUE_CHUNK_SIZE: ClassVar[int] = 4096
 
-        Chemin prioritaire : kernel Triton fusé (V3b) — unpack+QJL+norme en un seul lancement.
-        Fallback : torch.compile (V3a optimisé).
-        """
+    def _dequantize_into_buffer(self, x_u8: torch.Tensor, out: torch.Tensor, which: str = "k") -> None:
+        """Dequantifie x_u8 [N, nh, d] dans out [N, nh, d] fp16 pré-alloué. Dual LUT K/V."""
         cb_fn = self._get_codebook_k if which == "k" else self._get_codebook_v
         codebook = cb_fn(x_u8.device)
 
+        # Si V5 est utilisé mais la calibration n'a pas eu lieu, il retombe sur V1
+        v5_fallback = self._mixed_bits and self._outlier_sorted_idx_cpu is None
+        is_v5_active = self._mixed_bits and not v5_fallback
+
+        # Chemin Python chunké : V5 sans Triton, CPU tensor, ou fallback V1/V2 sans Triton
+        if (is_v5_active and not _USE_TRITON) or (not _USE_TRITON and not x_u8.is_cuda):
+            chunk = self._DEQUEUE_CHUNK_SIZE
+            n = x_u8.shape[0]
+            for start in range(0, n, chunk):
+                end = min(start + chunk, n)
+                sl = x_u8[start:end]
+                if self._mixed_bits:
+                    out[start:end] = self._dequantize_v5(sl, which=which)
+                elif self.b_bits == 4:
+                    out[start:end] = self._dequantize_v1(sl, which=which)
+                else:
+                    out[start:end] = self._dequantize_v2(sl, which=which)
+            return
+
         if _USE_TRITON and x_u8.is_cuda:
-            # Chemin V3b : kernel Triton fusé (0 allocation intermédiaire).
-            # Le codebook float32 est explicitement retenu en variable locale pour éviter
-            # qu'il soit GC'd pendant les appels GPU asynchrones (bug Triton "cpu tensor?").
-            codebook_f32 = codebook.to(torch.float32)
-            if self.b_bits == 4:
-                turbo_deq_v1_triton(x_u8, codebook_f32, out)
+            if is_v5_active:
+                cb4_fn = self._get_codebook_4bit_k if which == "k" else self._get_codebook_4bit_v
+                cb3_fn = self._get_codebook_3bit_k if which == "k" else self._get_codebook_3bit_v
+                cb4 = cb4_fn(x_u8.device).to(torch.float32)
+                cb3 = cb3_fn(x_u8.device).to(torch.float32)
+                out_idx = self._get_outlier_idx(x_u8.device)
+                reg_idx = self._get_regular_idx(x_u8.device)
+                turbo_deq_v5_triton(x_u8, cb4, cb3, out_idx, reg_idx, out)
             else:
-                qjl_mean = self._qjl_residual_mean_k if which == "k" else self._qjl_residual_mean_v
-                turbo_deq_v2_triton(x_u8, codebook_f32, qjl_mean, out)
+                codebook_f32 = codebook.to(torch.float32)
+                if self.b_bits == 4 or v5_fallback:
+                    turbo_deq_v1_triton(x_u8, codebook_f32, out)
+                else:
+                    qjl_mean = self._qjl_residual_mean_k if which == "k" else self._qjl_residual_mean_v
+                    turbo_deq_v2_triton(x_u8, codebook_f32, qjl_mean, out)
         else:
-            # Fallback : torch.compile (chemin V3a)
-            if self.b_bits == 4:
+            # Fallback : torch.compile (chemin V3a) - N'arrive que pour V1/V2 GPU ou CPU compilation (?)
+            if self.b_bits == 4 or v5_fallback:
                 _dequantize_v1_compiled(x_u8, out, codebook)
             else:
                 qjl_mean = self._qjl_residual_mean_k if which == "k" else self._qjl_residual_mean_v

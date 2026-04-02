@@ -346,6 +346,7 @@ class TritonAttentionBackend(AttentionBackend):
         "fp8_e5m2",
         "turbo_quant",       # TurboQuant V1 : rotation Hadamard + 4-bit Lloyd-Max + fp16 norm (arXiv:2504.19874)
         "turbo_quant_3bit",  # TurboQuant V2 : rotation Hadamard + 3-bit Lloyd-Max + QJL 1-bit + fp8 norm
+        "turbo_quant_35bit", # TurboQuant V5 : mixed-precision 3.5-bit (50% 4-bit + 50% 3-bit)
     ]
 
     @staticmethod
@@ -486,10 +487,18 @@ class TritonAttentionImpl(AttentionImpl):
                 num_q_heads=num_heads,
                 b_bits=3,  # V2 : 3-bit Lloyd-Max + QJL 1-bit + fp8 norme
             )
+        elif kv_cache_dtype == "turbo_quant_35bit":
+            self.turbo_quant = TurboQuantKV(
+                head_size=head_size,
+                num_kv_heads=num_kv_heads,
+                num_q_heads=num_heads,
+                b_bits=4,       # fallback 4-bit avant calibration
+                mixed_bits=True,  # V5 : 3.5-bit mixed-precision après calibration
+            )
 
         self.attn_type = attn_type
-        # turbo_quant et turbo_quant_3bit utilisent fp8_e5m2 comme format de stockage interne
-        _is_turbo = kv_cache_dtype in ("turbo_quant", "turbo_quant_3bit")
+        # turbo_quant* utilisent fp8_e5m2 comme format de stockage interne
+        _is_turbo = kv_cache_dtype in ("turbo_quant", "turbo_quant_3bit", "turbo_quant_35bit")
         _fp8_dtype_key = kv_cache_dtype if kv_cache_dtype.startswith("fp8") else (
             "fp8_e5m2" if _is_turbo else None
         )
@@ -581,7 +590,7 @@ class TritonAttentionImpl(AttentionImpl):
             assert layer._q_scale_float == 1.0, (
                 "A non 1.0 q_scale is not currently supported."
             )
-        if self.kv_cache_dtype in ("turbo_quant", "turbo_quant_3bit"):
+        if self.kv_cache_dtype in ("turbo_quant", "turbo_quant_3bit", "turbo_quant_35bit"):
             assert self.turbo_quant is not None
             # TurboQuant : dequantifier le cache uint8 (indices int4 + norme fp16)
             # vers fp16 avant le calcul d'attention (espace rotaté préservé)
@@ -608,7 +617,7 @@ class TritonAttentionImpl(AttentionImpl):
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
         # TurboQuant : pas de descale fp8 (le cache est déjà en fp16 dequantifié)
-        if self.kv_cache_dtype in ("turbo_quant", "turbo_quant_3bit"):
+        if self.kv_cache_dtype in ("turbo_quant", "turbo_quant_3bit", "turbo_quant_35bit"):
             k_descale_arg = None
             v_descale_arg = None
         else:

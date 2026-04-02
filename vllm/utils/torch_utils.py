@@ -43,6 +43,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_ds_mla": torch.uint8,
     "turbo_quant":      torch.uint8,  # TurboQuant V1 : 4-bit Lloyd-Max (arXiv:2504.19874)
     "turbo_quant_3bit": torch.uint8,  # TurboQuant V2 : 3-bit + QJL 1-bit + fp8 norme
+    "turbo_quant_35bit": torch.uint8, # TurboQuant V5 : mixed-precision 3.5-bit (×4.49 vs fp16)
 }
 
 TORCH_DTYPE_TO_NUMPY_DTYPE = {

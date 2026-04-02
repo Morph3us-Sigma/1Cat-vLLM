@@ -24,11 +24,21 @@ from __future__ import annotations
 
 import torch
 
+__all__ = [
+    "turbo_deq_v1_triton",
+    "turbo_deq_v2_triton",
+    "turbo_deq_v5_triton",
+    "is_triton_available",
+]
+
+from typing import Any
 try:
     import triton
     import triton.language as tl
     _TRITON_AVAILABLE = True
 except ImportError:
+    triton: Any = None
+    tl: Any = None
     _TRITON_AVAILABLE = False
 
 
@@ -213,6 +223,115 @@ if _TRITON_AVAILABLE:
         tl.store(out_ptr + base_out + offs_coord, result_f16)
 
 
+    @triton.jit
+    def _turbo_deq_v5_kernel(
+        x_ptr,
+        stride_x_n, stride_x_h, stride_x_d,
+        out_ptr,
+        stride_out_n, stride_out_h, stride_out_d,
+        cb4_ptr,
+        cb3_ptr,
+        out_idx_ptr,
+        stride_out_idx_h,
+        reg_idx_ptr,
+        stride_reg_idx_h,
+        N: tl.constexpr,
+        NH: tl.constexpr,
+        D: tl.constexpr,
+        BLOCK_D2: tl.constexpr,
+    ):
+        """Dequantifie V5 : 4-bit outliers + 3-bit regulars + norme fp8_e5m2 → fp16."""
+        prog_id = tl.program_id(0)
+        tok_id  = prog_id // NH
+        head_id = prog_id % NH
+
+        base_x   = tok_id * stride_x_n + head_id * stride_x_h
+        base_out = tok_id * stride_out_n + head_id * stride_out_h
+        base_out_idx = head_id * stride_out_idx_h
+        base_reg_idx = head_id * stride_reg_idx_h
+
+        # Codebooks
+        cb4 = tl.load(cb4_ptr + tl.arange(0, 16))
+        cb3 = tl.load(cb3_ptr + tl.arange(0, 8))
+
+        offs_coord = tl.arange(0, BLOCK_D2)  # D//2
+
+        # ── 1. Outliers 4-bit ──
+        # Les D//2 getters 4-bit sont dans les D//4 premiers bytes.
+        packed4_offs = offs_coord // 2
+        packed4_byte = tl.load(
+            x_ptr + base_x + packed4_offs,
+            mask=packed4_offs < (D // 4)
+        ).to(tl.int32)
+
+        is_even = (offs_coord % 2) == 0
+        idx4 = tl.where(is_even, (packed4_byte >> 4) & 0xF, packed4_byte & 0xF)
+        vals4 = tl.gather(cb4, idx4, 0)
+
+        # ── 2. Réguliers 3-bit ──
+        # Les D//2 getters 3-bit sont dans les 3D//16 bytes suivants (offset D//4).
+        offset3 = D // 4
+        N3 = (3 * D) // 16
+
+        group_id   = offs_coord // 8
+        local_pos  = offs_coord % 8
+
+        b0_offs = offset3 + group_id * 3
+        b1_offs = offset3 + group_id * 3 + 1
+        b2_offs = offset3 + group_id * 3 + 2
+
+        b0 = tl.load(x_ptr + base_x + b0_offs, mask=(group_id * 3) < N3).to(tl.int32)
+        b1 = tl.load(x_ptr + base_x + b1_offs, mask=(group_id * 3 + 1) < N3).to(tl.int32)
+        b2 = tl.load(x_ptr + base_x + b2_offs, mask=(group_id * 3 + 2) < N3).to(tl.int32)
+
+        v0 = b0 >> 5
+        v1 = (b0 >> 2) & 7
+        v2 = ((b0 & 3) << 1) | (b1 >> 7)
+        v3 = (b1 >> 4) & 7
+        v4 = (b1 >> 1) & 7
+        v5 = ((b1 & 1) << 2) | (b2 >> 6)
+        v6 = (b2 >> 3) & 7
+        v7 = b2 & 7
+
+        idx3 = (
+            tl.where(local_pos == 0, v0,
+            tl.where(local_pos == 1, v1,
+            tl.where(local_pos == 2, v2,
+            tl.where(local_pos == 3, v3,
+            tl.where(local_pos == 4, v4,
+            tl.where(local_pos == 5, v5,
+            tl.where(local_pos == 6, v6, v7)))))))
+        )
+        vals3 = tl.gather(cb3, idx3, 0)
+
+        # ── 3. Norme fp8_e5m2 ──
+        norm_offs = D // 4 + N3
+        norm_u8 = tl.load(x_ptr + base_x + norm_offs).to(tl.uint8)
+
+        sign_bit  = (norm_u8 >> 7) & 1
+        exp_bits  = (norm_u8 >> 2) & 0x1F
+        mant_bits = norm_u8 & 0x3
+        
+        exp_val  = exp_bits.to(tl.float32) - 15.0
+        mant_val = 1.0 + mant_bits.to(tl.float32) * 0.25
+        norm_f32 = tl.where(
+            exp_bits == 0,
+            mant_bits.to(tl.float32) * 0.25 * (2.0 ** (-14.0)),
+            mant_val * tl.exp2(exp_val)
+        )
+        norm_f32 = tl.where(sign_bit == 1, -norm_f32, norm_f32)
+
+        # ── 4. Scatter fp16 ──
+        res4_f16 = (vals4 * norm_f32).to(tl.float16)
+        res3_f16 = (vals3 * norm_f32).to(tl.float16)
+
+        out_idx = tl.load(out_idx_ptr + base_out_idx + offs_coord)
+        reg_idx = tl.load(reg_idx_ptr + base_reg_idx + offs_coord)
+
+        tl.store(out_ptr + base_out + out_idx, res4_f16)
+        tl.store(out_ptr + base_out + reg_idx, res3_f16)
+
+
 # ── Interface Python ──────────────────────────────────────────────────────────
 
 def turbo_deq_v2_triton(
@@ -239,10 +358,10 @@ def turbo_deq_v2_triton(
         x_u8, x_u8.stride(0), x_u8.stride(1), x_u8.stride(2),
         out, out.stride(0), out.stride(1), out.stride(2),
         codebook,
-        ebar,
-        N=N, NH=NH, D=D,
-        N3=n3, NS=ns,
-        BLOCK_D=D,
+        ebar,  # type: ignore[arg-type]
+        N=N, NH=NH, D=D,  # type: ignore[arg-type]
+        N3=n3, NS=ns,  # type: ignore[arg-type]
+        BLOCK_D=D,  # type: ignore[arg-type]
         num_warps=4,  # type: ignore[call-arg]
         num_stages=2,  # type: ignore[call-arg]
     )
@@ -263,8 +382,35 @@ def turbo_deq_v1_triton(
         x_u8, x_u8.stride(0), x_u8.stride(1), x_u8.stride(2),
         out, out.stride(0), out.stride(1), out.stride(2),
         codebook,
-        N=N, NH=NH, D=D,
-        BLOCK_D=D,
+        N=N, NH=NH, D=D,  # type: ignore[arg-type]
+        BLOCK_D=D,  # type: ignore[arg-type]
+        num_warps=4,  # type: ignore[call-arg]
+        num_stages=2,  # type: ignore[call-arg]
+    )
+
+
+def turbo_deq_v5_triton(
+    x_u8: torch.Tensor,         # [N, NH, D] uint8
+    cb4: torch.Tensor,          # [16] float32 sur GPU
+    cb3: torch.Tensor,          # [8] float32 sur GPU
+    out_idx: torch.Tensor,      # [NH, D//2] int64 sur GPU
+    reg_idx: torch.Tensor,      # [NH, D//2] int64 sur GPU
+    out: torch.Tensor,          # [N, NH, D] fp16 pré-alloué
+) -> None:
+    """Dequantifie V5 via kernel Triton fusé."""
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError("Triton non disponible")
+
+    N, NH, D = x_u8.shape
+    grid = (N * NH,)
+    _turbo_deq_v5_kernel[grid](
+        x_u8, x_u8.stride(0), x_u8.stride(1), x_u8.stride(2),
+        out, out.stride(0), out.stride(1), out.stride(2),
+        cb4, cb3,
+        out_idx, out_idx.stride(0),
+        reg_idx, reg_idx.stride(0),
+        N=N, NH=NH, D=D,  # type: ignore[arg-type]
+        BLOCK_D2=D // 2,  # type: ignore[arg-type]
         num_warps=4,  # type: ignore[call-arg]
         num_stages=2,  # type: ignore[call-arg]
     )
